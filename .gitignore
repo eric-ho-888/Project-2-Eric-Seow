@@ -1,10 +1,6 @@
 # Security secrets
 .env
 
-# Local DuckDB database files (prevent massive file uploads)
-*.duckdb
-*.duckdb.wal
-
 # Python cache files
 __pycache__/
 *.pyc
