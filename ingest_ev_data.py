@@ -1,0 +1,165 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "f67353c6",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Key loaded successfully!\n"
+     ]
+    }
+   ],
+   "source": [
+    "import os\n",
+    "from dotenv import load_dotenv\n",
+    "\n",
+    "# Search for the .env file and load the variables into the session\n",
+    "load_dotenv()\n",
+    "\n",
+    "# The rest of your script stays exactly the same\n",
+    "api_key = os.environ.get('LTA_API_KEY')\n",
+    "\n",
+    "if not api_key:\n",
+    "    raise ValueError(\"LTA_API_KEY environment variable not set. Check your .env file.\")\n",
+    "\n",
+    "print(\"Key loaded successfully!\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "0627808b",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Successfully ingested snapshot. Total records in DuckDB: 11528\n"
+     ]
+    }
+   ],
+   "source": [
+    "import json\n",
+    "import requests\n",
+    "import pandas as pd\n",
+    "import duckdb\n",
+    "\n",
+    "def safe_float(val):\n",
+    "    try:\n",
+    "        return float(val) if pd.notna(val) and str(val).strip() != \"\" else None\n",
+    "    except (ValueError, TypeError):\n",
+    "        return None\n",
+    "\n",
+    "# 1. Fetch S3 Download Link\n",
+    "api_key = os.environ.get('LTA_API_KEY')\n",
+    "if not api_key:\n",
+    "    raise ValueError(\"LTA_API_KEY environment variable not set.\")\n",
+    "\n",
+    "lta_api_url = \"https://datamall2.mytransport.sg/ltaodataservice/EVCBatch\"\n",
+    "headers = {'AccountKey': api_key, 'accept': 'application/json'}\n",
+    "\n",
+    "response = requests.get(lta_api_url, headers=headers)\n",
+    "response.raise_for_status()\n",
+    "data = response.json()\n",
+    "\n",
+    "s3_url = data['Link'] if 'Link' in data else data['value'][0]['Link']\n",
+    "\n",
+    "# 2. Download and Parse JSON Payload\n",
+    "s3_response = requests.get(s3_url)\n",
+    "s3_response.raise_for_status()\n",
+    "ev_payload = s3_response.json()\n",
+    "records = ev_payload.get('value', ev_payload)\n",
+    "\n",
+    "df_raw = pd.DataFrame(records)\n",
+    "\n",
+    "# 3. Flatten Nested Structure\n",
+    "rows = []\n",
+    "for index, row in df_raw.iterrows():\n",
+    "    updated_at = row['LastUpdatedTime']\n",
+    "    loc = row['evLocationsData']\n",
+    "\n",
+    "    if isinstance(loc, str):\n",
+    "        try:\n",
+    "            loc = json.loads(loc)\n",
+    "        except json.JSONDecodeError:\n",
+    "            continue\n",
+    "\n",
+    "    address = loc.get('address')\n",
+    "    postal = loc.get('postalCode')\n",
+    "    lat = loc.get('latitude')\n",
+    "    lon = loc.get('longtitude')\n",
+    "\n",
+    "    for cp in loc.get('chargingPoints', []):\n",
+    "        operator = cp.get('operator')\n",
+    "        position = cp.get('position')\n",
+    "\n",
+    "        for pt in cp.get('plugTypes', []):\n",
+    "            plug_type = pt.get('plugType')\n",
+    "            current_type = pt.get('current')\n",
+    "            power_rating = pt.get('powerRating')\n",
+    "            price = pt.get('price')\n",
+    "\n",
+    "            for ev in pt.get('evIds', []):\n",
+    "                charger_id = ev.get('evCpId')\n",
+    "                status = ev.get('status')\n",
+    "\n",
+    "                rows.append({\n",
+    "                    'snapshot_time': updated_at,\n",
+    "                    'address': address,\n",
+    "                    'postal_code': postal,\n",
+    "                    'latitude': safe_float(lat),\n",
+    "                    'longitude': safe_float(lon),\n",
+    "                    'operator': operator,\n",
+    "                    'position': position,\n",
+    "                    'plug_type': plug_type,\n",
+    "                    'current_type': current_type,\n",
+    "                    'power_rating_kw': safe_float(power_rating),\n",
+    "                    'price_per_kwh': safe_float(price),\n",
+    "                    'charger_id': charger_id,\n",
+    "                    'current_status': status\n",
+    "                })\n",
+    "\n",
+    "df_flat = pd.DataFrame(rows)\n",
+    "\n",
+    "# 4. Append to DuckDB\n",
+    "con = duckdb.connect('ev_pipeline.duckdb')\n",
+    "con.execute(\"\"\"\n",
+    "CREATE TABLE IF NOT EXISTS raw_charger_snapshots AS \n",
+    "SELECT * FROM df_flat WHERE 1=0;\n",
+    "\"\"\")\n",
+    "con.execute(\"INSERT INTO raw_charger_snapshots SELECT * FROM df_flat;\")\n",
+    "\n",
+    "total_count = con.execute(\"SELECT COUNT(*) FROM raw_charger_snapshots;\").fetchone()[0]\n",
+    "print(f\"Successfully ingested snapshot. Total records in DuckDB: {total_count}\")\n",
+    "con.close()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "bde",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.14"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
